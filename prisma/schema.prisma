@@ -1,0 +1,233 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+//
+// ENUMS
+//
+
+enum Currency {
+  BRL
+  USD
+  EUR
+}
+
+enum CatalogChangeType {
+  UPSERT
+  DELETE
+}
+
+enum OrderStatus {
+  PENDING_VALIDATION
+  REQUIRES_CONFIRMATION
+  CONFIRMED
+  REJECTED
+  CANCELLED
+}
+
+enum OrderEventType {
+  ORDER_CREATED
+  ORDER_VALIDATED
+  PRICE_CHANGED
+  READY_TO_CONFIRM
+  ORDER_CONFIRMED
+  ORDER_REJECTED
+  ORDER_CANCELLED
+}
+
+//
+// CATALOG VERSIONING (snapshot + delta)
+//
+
+model CatalogState {
+  /// Singleton: manter sempre uma linha com id="global"
+  id             String   @id @default("global")
+  currentVersion Int      @default(0) @map("current_version")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@map("catalog_states")
+}
+
+model Product {
+  id          String  @id @default(uuid()) @db.Uuid
+  sku         String? @unique
+  name        String
+  description String?
+  imageUrl    String? @map("image_url")
+
+  /// Soft delete: mantém histórico e permite delta DELETE sem perder referência
+  deletedAt DateTime? @map("deleted_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  price     ProductPrice?
+  inventory Inventory?
+
+  changes    ProductChange[]
+  orderItems OrderItem[]
+
+  @@index([deletedAt])
+  @@index([updatedAt])
+  @@index([name])
+  @@map("products")
+}
+
+model ProductPrice {
+  /// 1:1 com Product
+  productId  String   @id @default(uuid()) @map("product_id") @db.Uuid
+  priceCents Int      @map("price_cents")
+  currency   Currency @default(BRL)
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([updatedAt])
+  @@map("product_prices")
+}
+
+model Inventory {
+  /// Opcional, mas útil para "OUT_OF_STOCK" (mesmo que você implemente depois)
+  productId   String   @id @default(uuid()) @map("product_id") @db.Uuid
+  stockOnHand Int      @default(0) @map("stock_on_hand")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([updatedAt])
+  @@map("inventories")
+}
+
+/// Log de mudanças para o delta sync
+/// O cursor do cliente é: sinceVersion < version
+model ProductChange {
+  /// Versão global do catálogo (monótona)
+  version Int @id @default(autoincrement())
+
+  type      CatalogChangeType
+  productId String            @map("product_id") @db.Uuid
+
+  /// Payload opcional (pode incluir snapshot do produto/preço para facilitar o apply no client)
+  payload Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  /// Prefira manter Product soft-deletado (não hard delete), para não perder histórico
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([productId])
+  @@index([createdAt])
+  @@map("product_changes")
+}
+
+//
+// ORDERS (repricing + confirm)
+//
+
+model Order {
+  id     String      @id @default(uuid()) @db.Uuid
+  status OrderStatus @default(PENDING_VALIDATION)
+
+  /// Versão do catálogo que o cliente tinha ao montar o pedido
+  clientCatalogVersion Int @map("client_catalog_version")
+
+  /// Total calculado no servidor (sempre em centavos)
+  totalCents Int      @default(0) @map("total_cents")
+  currency   Currency @default(BRL)
+
+  /// Auditoria mínima (pode evoluir depois p/ userId/deviceId)
+  clientRequestId String? @unique @map("client_request_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  items  OrderItem[]
+  events OrderEvent[]
+
+  @@index([status, createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id        String @id @default(uuid()) @db.Uuid
+  orderId   String @map("order_id") @db.Uuid
+  productId String @map("product_id") @db.Uuid
+
+  qty Int
+
+  /// Preço visto no cliente (offline/local)
+  clientPriceCents Int @map("client_price_cents")
+
+  /// Preço aplicado pelo servidor após reprecificação
+  serverPriceCents Int? @map("server_price_cents")
+
+  /// Snapshot opcional para o pedido continuar “legível” mesmo se o produto mudar
+  productNameSnapshot  String? @map("product_name_snapshot")
+  productSkuSnapshot   String? @map("product_sku_snapshot")
+  productImageSnapshot String? @map("product_image_snapshot")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@index([productId])
+  @@map("order_items")
+}
+
+//
+// EVENTS (SSE + replay)
+//
+
+model OrderEvent {
+  id      String         @id @default(uuid()) @db.Uuid
+  orderId String         @map("order_id") @db.Uuid
+  type    OrderEventType
+  payload Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, createdAt])
+  @@map("order_events")
+}
+
+//
+// IDEMPOTENCY (avoid duplicates on retries)
+//
+
+model IdempotencyKey {
+  /// Header: Idempotency-Key
+  key String @id
+
+  /// Opcional: ajuda a validar reuso indevido (mesma key com payload diferente)
+  requestHash String? @map("request_hash")
+
+  /// Resposta cacheada para replays (ex.: body do POST /orders)
+  responseBody   Json? @map("response_body")
+  responseStatus Int?  @map("response_status")
+
+  /// Opcional: para depuração/organização
+  method String?
+  path   String?
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  expiresAt DateTime? @map("expires_at")
+
+  @@index([expiresAt])
+  @@map("idempotency_keys")
+}
